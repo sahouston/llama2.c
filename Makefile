@@ -57,7 +57,7 @@ runompgnu:
 # run cuda
 .PHONY: runcuda
 runcuda: run.cu
-	$(NVCC) -DUSE_CUDA -O3 -o runcuda run.cu -lm -lcublas
+	$(NVCC) -DUSE_CUDA -O3 -o runcuda run.cu -lm -lcublas -Xcompiler -fopenmp
 
 # run debug cuda
 .PHONY: rundebugcuda

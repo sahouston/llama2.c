@@ -13,6 +13,40 @@
     #include <unistd.h>
     #include <sys/mman.h>
 #endif
+
+#include <cuda_runtime.h>
+#include <cub/cub.cuh>
+#include <cublas_v2.h>
+
+cublasHandle_t g_cublas_handle = nullptr;
+
+void create_cublas_handle() {
+    cublasStatus_t stat = cublasCreate(&g_cublas_handle);
+    if (stat != CUBLAS_STATUS_SUCCESS) {
+        printf ("CUBLAS initialization failed\n");
+        exit(EXIT_FAILURE);
+    }
+}
+void destroy_cublas_handle() {
+    cublasStatus_t stat = cublasDestroy(g_cublas_handle);
+    if (stat != CUBLAS_STATUS_SUCCESS) {
+        printf ("CUBLAS initialization failed\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+// Each CUDA function call should be checked for errors.
+#define CUCHK(err) cuda_check((err), __FILE__, __LINE__)
+inline void cuda_check(cudaError_t error_code, const char *file, int line)
+{
+    if (error_code != cudaSuccess)
+    {
+        fprintf(stderr, "CUDA Error %d: %s. In file '%s' on line %d\n", error_code, cudaGetErrorString(error_code), file, line);
+        fflush(stderr);
+        exit(error_code);
+    }
+}
+
 // ----------------------------------------------------------------------------
 // Transformer model
 
@@ -51,9 +85,12 @@ typedef struct {
     // current wave of activations
     float *x; // activation at current time stamp (dim,)
     float *xb; // same, but inside a residual branch (dim,)
+    float *xb_cuda; // space for xb on cuda device
     float *xb2; // an additional buffer just for convenience (dim,)
     float *hb; // buffer for hidden dimension in the ffn (hidden_dim,)
+    float *hb_cuda; // space for hb on cuda device
     float *hb2; // buffer for hidden dimension in the ffn (hidden_dim,)
+    float *hb2_cuda; // space for hb2 on cuda device
     float *q; // query (dim,)
     float *k; // key (dim,)
     float *v; // value (dim,)
@@ -79,9 +116,12 @@ void malloc_run_state(RunState* s, Config* p) {
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
     s->x = (float *)calloc(p->dim, sizeof(float));
     s->xb = (float *)calloc(p->dim, sizeof(float));
+    CUCHK(cudaMalloc((void**)&s->xb_cuda, p->dim * sizeof(float)));
     s->xb2 = (float *)calloc(p->dim, sizeof(float));
     s->hb = (float *)calloc(p->hidden_dim, sizeof(float));
+    CUCHK(cudaMalloc((void**)&s->hb_cuda, p->hidden_dim * sizeof(float)));
     s->hb2 = (float *)calloc(p->hidden_dim, sizeof(float));
+    CUCHK(cudaMalloc((void**)&s->hb2_cuda, p->hidden_dim * sizeof(float)));
     s->q = (float *)calloc(p->dim, sizeof(float));
     s->key_cache = (float *)calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
     s->value_cache = (float *)calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
@@ -126,12 +166,23 @@ void memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int shared
     ptr += n_layers * (p->n_heads * head_size) * p->dim;
     w->rms_ffn_weight = ptr;
     ptr += n_layers * p->dim;
-    w->w1 = ptr;
+
+    // copy w1 to cuda device memory
+    size_t w_size = n_layers * p->dim * p->hidden_dim * sizeof(float);
+    std::cout << n_layers * p->dim * p->hidden_dim * sizeof(float) << std::endl;
+    CUCHK(cudaMalloc((void**)&w->w1, w_size));
+    CUCHK(cudaMemcpy(w->w1, ptr, w_size, cudaMemcpyHostToDevice));
     ptr += n_layers * p->dim * p->hidden_dim;
+
     w->w2 = ptr;
     ptr += n_layers * p->hidden_dim * p->dim;
-    w->w3 = ptr;
+
+    // copy w2 to cuda device memory
+    w_size = n_layers * p->dim * p->hidden_dim * sizeof(float);
+    CUCHK(cudaMalloc((void**)&w->w3, w_size));
+    CUCHK(cudaMemcpy(w->w3, ptr, w_size, cudaMemcpyHostToDevice));
     ptr += n_layers * p->dim * p->hidden_dim;
+
     w->rms_final_weight = ptr;
     ptr += p->dim;
     ptr += p->seq_len * head_size / 2; // skip what used to be freq_cis_real (for RoPE)
@@ -228,6 +279,20 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
     }
 }
 
+// Use cuBLAS for matmul to leverage this included, high-performance library.
+void matmul_cuda(float* xout, float* x, float* w, int n, int d) {
+    // W (d,n) @ x (n,) -> xout (d,)
+    // W is stored in this order: (n=0,d=0), (n=1,d=0), (n=2,d=0), ... 
+    // so W is n x d in cublas terms & we'll need to transpose.
+    // Sgemv does y = alpha * op(A) * x + beta * y (modifying y)
+    //   where op can transpose the matrix A
+    // Translating to our local vars, that is
+    // xout = 1.0*op(w)*x + 0.0*xout
+    float alpha = 1.0f;
+    float beta = 0.0f; // when this is 0, xout will not be used for input
+    cublasSgemv(g_cublas_handle, CUBLAS_OP_T, n, d, &alpha, w, n, x, 1, &beta, xout, 1);
+}
+
 float* forward(Transformer* transformer, int token, int pos) {
 
     // a few convenience variables
@@ -257,7 +322,8 @@ float* forward(Transformer* transformer, int token, int pos) {
         s->v = s->value_cache + loff + pos * kv_dim;
 
         // qkv matmuls for this position
-        matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
+        // 768 * 768 * 3 * 12 = 21,233,664       
+        matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim); 
         matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
         matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
 
@@ -319,6 +385,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         }
 
         // final matmul to get the output of the attention
+        // 589,824 * 12 = 7,077,888
         matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
 
         // residual connection back into x
@@ -331,8 +398,14 @@ float* forward(Transformer* transformer, int token, int pos) {
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
-        matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
-        matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+        // 768 * 2048 * 2 * 12 = 37,748,736
+
+        // Perform this matmal on the cuda device
+        CUCHK(cudaMemcpy(s->xb_cuda, s->xb, p->dim * sizeof(float), cudaMemcpyHostToDevice));
+        matmul_cuda(s->hb_cuda, s->xb_cuda, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
+        matmul_cuda(s->hb2_cuda, s->xb_cuda, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
+        CUCHK(cudaMemcpy(s->hb, s->hb_cuda, p->hidden_dim * sizeof(float), cudaMemcpyDeviceToHost));
+        CUCHK(cudaMemcpy(s->hb2, s->hb2_cuda, p->hidden_dim * sizeof(float), cudaMemcpyDeviceToHost));
 
         // SwiGLU non-linearity
         for (int i = 0; i < hidden_dim; i++) {
@@ -345,6 +418,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         }
 
         // final matmul to get the output of the ffn
+        // 1,572,864 * 12 = 18,874,368
         matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
 
         // residual connection
@@ -357,6 +431,7 @@ float* forward(Transformer* transformer, int token, int pos) {
     rmsnorm(x, x, w->rms_final_weight, dim);
 
     // classifier into logits
+    // 24,576,000
     matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
     return s->logits;
 }
@@ -954,6 +1029,8 @@ int main(int argc, char *argv[]) {
     Sampler sampler;
     build_sampler(&sampler, transformer.config.vocab_size, temperature, topp, rng_seed);
 
+    create_cublas_handle();
+
     // run!
     if (strcmp(mode, "generate") == 0) {
         generate(&transformer, &tokenizer, &sampler, prompt, steps);
@@ -968,6 +1045,7 @@ int main(int argc, char *argv[]) {
     free_sampler(&sampler);
     free_tokenizer(&tokenizer);
     free_transformer(&transformer);
+    destroy_cublas_handle();
     return 0;
 }
 #endif
