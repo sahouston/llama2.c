@@ -13,6 +13,13 @@
     #include <unistd.h>
     #include <sys/mman.h>
 #endif
+#ifdef USE_OPENVINO
+#include <memory>
+#include "openvino/openvino.hpp"
+#include "openvino/opsets/opset1.hpp"
+#include "openvino/opsets/opset13.hpp"
+#endif
+
 // ----------------------------------------------------------------------------
 // Transformer model
 
@@ -77,16 +84,16 @@ typedef struct {
 void malloc_run_state(RunState* s, Config* p) {
     // we calloc instead of malloc to keep valgrind happy
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
-    s->x = calloc(p->dim, sizeof(float));
-    s->xb = calloc(p->dim, sizeof(float));
-    s->xb2 = calloc(p->dim, sizeof(float));
-    s->hb = calloc(p->hidden_dim, sizeof(float));
-    s->hb2 = calloc(p->hidden_dim, sizeof(float));
-    s->q = calloc(p->dim, sizeof(float));
-    s->key_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-    s->value_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-    s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
-    s->logits = calloc(p->vocab_size, sizeof(float));
+    s->x = (float*)calloc(p->dim, sizeof(float));
+    s->xb = (float*)calloc(p->dim, sizeof(float));
+    s->xb2 = (float*)calloc(p->dim, sizeof(float));
+    s->hb = (float*)calloc(p->hidden_dim, sizeof(float));
+    s->hb2 = (float*)calloc(p->hidden_dim, sizeof(float));
+    s->q = (float*)calloc(p->dim, sizeof(float));
+    s->key_cache = (float*)calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
+    s->value_cache = (float*)calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
+    s->att = (float*)calloc(p->n_heads * p->seq_len, sizeof(float));
+    s->logits = (float*)calloc(p->vocab_size, sizeof(float));
     // ensure all mallocs went fine
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
      || !s->key_cache || !s->value_cache || !s->att || !s->logits) {
@@ -155,7 +162,7 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     // memory map the Transformer weights into the data pointer
     *fd = open(checkpoint, O_RDONLY); // open in read only mode
     if (*fd == -1) { fprintf(stderr, "open failed!\n"); exit(EXIT_FAILURE); }
-    *data = mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
+    *data = (float*)mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
     if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
     float* weights_ptr = *data + sizeof(Config)/sizeof(float);
     memory_map_weights(weights, config, weights_ptr, shared_weights);
@@ -214,6 +221,37 @@ void softmax(float* x, int size) {
     }
 }
 
+void matmul_ov(float* xout, float* x, float* w, int n, int d) {
+    // W (d,n) @ x (n,) -> xout (d,)
+    ov::Core core;
+    static bool first = true;
+    if (first) {
+        std::cout << ov::get_openvino_version() << std::endl;
+        std::cout << "Device info: " << std::endl;
+        std::cout << core.get_versions("CPU") << std::endl;
+        first = false;
+    } 
+
+    ov::op::Op* input;
+
+    auto paramNode = std::make_shared<ov::opset13::Parameter>(ov::element::Type_t::f32, ov::Shape({(long unsigned int)n}));
+
+    auto weightsShape = ov::Shape{(long unsigned int)d, (long unsigned int)n};
+    auto weightsConstNode = std::make_shared<ov::opset13::Constant>(ov::element::Type_t::f32, weightsShape, w);
+
+    auto matMul = std::make_shared<ov::opset13::MatMul>(paramNode->output(0), weightsConstNode->output(0), false, true);
+    auto result = std::make_shared<ov::opset13::Result>(matMul->output(0));
+    std::shared_ptr<ov::Model> model = std::make_shared<ov::Model>(result, ov::ParameterVector{paramNode}, "matmul");
+
+    ov::CompiledModel compiled_model = core.compile_model(model, "CPU");
+    ov::InferRequest infer_request = compiled_model.create_infer_request();
+    ov::Tensor input_tensor = infer_request.get_input_tensor();
+    std::memcpy(input_tensor.data(), x, sizeof(float) * n);
+    infer_request.infer();
+    const ov::Tensor output_tensor = infer_request.get_output_tensor();
+    std::memcpy(xout, output_tensor.data(), sizeof(float) * d);
+}
+
 void matmul(float* xout, float* x, float* w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
@@ -226,10 +264,23 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
         }
         xout[i] = val;
     }
+
+#if 0
+    float* xout_ov = (float*)malloc(sizeof(float) * d);
+    matmul_ov(xout_ov, x, w, n, d);
+
+    for (i = 0; i < d; i++) {
+        if (abs(xout[i] - xout_ov[i]) > 0.001) {
+            printf("Mismatch at %d: %f, %f\n", i, xout[i], xout_ov[i]);
+            break;
+        }
+    }
+    free(xout_ov);
+#endif
 }
 
-float* forward(Transformer* transformer, int token, int pos) {
 
+float* forward(Transformer* transformer, int token, int pos) {
     // a few convenience variables
     Config* p = &transformer->config;
     TransformerWeights* w = &transformer->weights;
@@ -445,7 +496,7 @@ void safe_printf(char *piece) {
 int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
     // efficiently find the perfect match for str in vocab, return its index or -1 if not found
     TokenIndex tok = { .str = str }; // acts as the key to search for
-    TokenIndex *res = bsearch(&tok, sorted_vocab, vocab_size, sizeof(TokenIndex), compare_tokens);
+    TokenIndex *res = (TokenIndex*)bsearch(&tok, sorted_vocab, vocab_size, sizeof(TokenIndex), compare_tokens);
     return res != NULL ? res->id : -1;
 }
 
@@ -456,7 +507,7 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
 
     if (t->sorted_vocab == NULL) {
         // lazily malloc and sort the vocabulary
-        t->sorted_vocab = malloc(t->vocab_size * sizeof(TokenIndex));
+        t->sorted_vocab = (TokenIndex*)malloc(t->vocab_size * sizeof(TokenIndex));
         for (int i = 0; i < t->vocab_size; i++) {
             t->sorted_vocab[i].str = t->vocab[i];
             t->sorted_vocab[i].id = i;
@@ -466,7 +517,7 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
 
     // create a temporary buffer that will store merge candidates of always two consecutive tokens
     // *2 for concat, +1 for null terminator +2 for UTF8 (in case max_token_length is 1)
-    char* str_buffer = malloc((t->max_token_length*2 +1 +2) * sizeof(char));
+    char* str_buffer = (char*)malloc((t->max_token_length*2 +1 +2) * sizeof(char));
     size_t str_len = 0;
 
     // start at 0 tokens
@@ -480,7 +531,7 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
     // TODO: pretty sure this isn't correct in the general case but I don't have the
     // energy to read more of the sentencepiece code to figure out what it's doing
     if (text[0] != '\0') {
-        int dummy_prefix = str_lookup(" ", t->sorted_vocab, t->vocab_size);
+        int dummy_prefix = str_lookup((char*)" ", t->sorted_vocab, t->vocab_size);
         tokens[(*n_tokens)++] = dummy_prefix;
     }
 
@@ -670,7 +721,7 @@ void build_sampler(Sampler* sampler, int vocab_size, float temperature, float to
     sampler->topp = topp;
     sampler->rng_state = rng_seed;
     // buffer only used with nucleus sampling; may not need but it's ~small
-    sampler->probindex = malloc(sampler->vocab_size * sizeof(ProbIndex));
+    sampler->probindex = (ProbIndex*)malloc(sampler->vocab_size * sizeof(ProbIndex));
 }
 
 void free_sampler(Sampler* sampler) {
@@ -727,7 +778,7 @@ long time_in_ms() {
 // generation loop
 
 void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
-    char *empty_prompt = "";
+    char *empty_prompt = (char*)"";
     if (prompt == NULL) { prompt = empty_prompt; }
 
     // encode the (string) prompt into tokens sequence
@@ -907,13 +958,13 @@ int main(int argc, char *argv[]) {
 
     // default parameters
     char *checkpoint_path = NULL;  // e.g. out/model.bin
-    char *tokenizer_path = "tokenizer.bin";
+    char *tokenizer_path = (char*)"tokenizer.bin";
     float temperature = 1.0f;   // 0.0 = greedy deterministic. 1.0 = original. don't set higher
     float topp = 0.9f;          // top-p in nucleus sampling. 1.0 = off. 0.9 works well, but slower
     int steps = 256;            // number of steps to run for
     char *prompt = NULL;        // prompt string
     unsigned long long rng_seed = 0; // seed rng with time by default
-    char *mode = "generate";    // generate|chat
+    char *mode = (char*)"generate";    // generate|chat
     char *system_prompt = NULL; // the (optional) system prompt to use in chat mode
 
     // poor man's C argparse so we can override the defaults above from the command line

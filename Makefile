@@ -1,6 +1,7 @@
 # choose your compiler, e.g. gcc/clang
 # example override to clang: make run CC=clang
 CC = gcc
+CPP = g++
 
 # the most basic way of building that is most likely to work on most systems
 .PHONY: run
@@ -35,6 +36,11 @@ runfast: run.c
 runomp: run.c
 	$(CC) -Ofast -fopenmp -march=native run.c  -lm  -o run
 	$(CC) -Ofast -fopenmp -march=native runq.c  -lm  -o runq
+
+.PHONY: runopenvino
+runopenvino: run.c
+	$(CPP) -Ofast -DUSE_OPENVINO -I $(INTEL_OPENVINO_DIR)/runtime/include -L $(INTEL_OPENVINO_DIR)/runtime/lib/intel64 -o run run.c -lm -lopenvino
+
 
 .PHONY: win64
 win64:
