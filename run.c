@@ -20,6 +20,8 @@
 #include "openvino/opsets/opset13.hpp"
 #endif
 
+ov::Core core;
+
 // ----------------------------------------------------------------------------
 // Transformer model
 
@@ -72,9 +74,16 @@ typedef struct {
 } RunState;
 
 typedef struct {
+    std::shared_ptr<ov::Model> to_logits_model;
+    ov::CompiledModel to_logits_compiled_model;
+    ov::InferRequest to_logits_req;
+} OvModels;
+
+typedef struct {
     Config config; // the hyperparameters of the architecture (the blueprint)
     TransformerWeights weights; // the weights of the model
     RunState state; // buffers for the "wave" of activations in the forward pass
+    OvModels ov_models; // OpenVINO models and inference requests
     // some more state needed to properly clean up the memory mapping (sigh)
     int fd; // file descriptor for memory mapping
     float* data; // memory mapped data pointer
@@ -168,11 +177,31 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     memory_map_weights(weights, config, weights_ptr, shared_weights);
 }
 
+void build_openvino_models(Transformer *t) {
+    std::cout << ov::get_openvino_version() << std::endl;
+    std::cout << "Device info: " << std::endl;
+    std::cout << core.get_versions("CPU") << std::endl;
+
+    // Classifier into logits
+    auto paramNode = std::make_shared<ov::opset13::Parameter>(ov::element::Type_t::f32, ov::Shape({(long unsigned int)t->config.dim}));
+
+    auto weightsShape = ov::Shape{(long unsigned int)t->config.vocab_size, (long unsigned int)t->config.dim};
+    auto weightsConstNode = std::make_shared<ov::opset13::Constant>(ov::element::Type_t::f32, weightsShape, t->weights.wcls);
+
+    auto matMul = std::make_shared<ov::opset13::MatMul>(paramNode->output(0), weightsConstNode->output(0), false, true);
+    auto result = std::make_shared<ov::opset13::Result>(matMul->output(0));
+    t->ov_models.to_logits_model = std::make_shared<ov::Model>(result, ov::ParameterVector{paramNode}, "matmul");
+    t->ov_models.to_logits_compiled_model = core.compile_model(t->ov_models.to_logits_model, "CPU");
+    t->ov_models.to_logits_req = t->ov_models.to_logits_compiled_model.create_infer_request();
+}
+
 void build_transformer(Transformer *t, char* checkpoint_path) {
     // read in the Config and the Weights from the checkpoint
     read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size);
     // allocate the RunState buffers
     malloc_run_state(&t->state, &t->config);
+    // build openvino models
+    build_openvino_models(t);
 }
 
 void free_transformer(Transformer* t) {
@@ -221,36 +250,6 @@ void softmax(float* x, int size) {
     }
 }
 
-void matmul_ov(float* xout, float* x, float* w, int n, int d) {
-    // W (d,n) @ x (n,) -> xout (d,)
-    ov::Core core;
-    static bool first = true;
-    if (first) {
-        std::cout << ov::get_openvino_version() << std::endl;
-        std::cout << "Device info: " << std::endl;
-        std::cout << core.get_versions("CPU") << std::endl;
-        first = false;
-    } 
-
-    ov::op::Op* input;
-
-    auto paramNode = std::make_shared<ov::opset13::Parameter>(ov::element::Type_t::f32, ov::Shape({(long unsigned int)n}));
-
-    auto weightsShape = ov::Shape{(long unsigned int)d, (long unsigned int)n};
-    auto weightsConstNode = std::make_shared<ov::opset13::Constant>(ov::element::Type_t::f32, weightsShape, w);
-
-    auto matMul = std::make_shared<ov::opset13::MatMul>(paramNode->output(0), weightsConstNode->output(0), false, true);
-    auto result = std::make_shared<ov::opset13::Result>(matMul->output(0));
-    std::shared_ptr<ov::Model> model = std::make_shared<ov::Model>(result, ov::ParameterVector{paramNode}, "matmul");
-
-    ov::CompiledModel compiled_model = core.compile_model(model, "CPU");
-    ov::InferRequest infer_request = compiled_model.create_infer_request();
-    ov::Tensor input_tensor = infer_request.get_input_tensor();
-    std::memcpy(input_tensor.data(), x, sizeof(float) * n);
-    infer_request.infer();
-    const ov::Tensor output_tensor = infer_request.get_output_tensor();
-    std::memcpy(xout, output_tensor.data(), sizeof(float) * d);
-}
 
 void matmul(float* xout, float* x, float* w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
@@ -264,27 +263,24 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
         }
         xout[i] = val;
     }
-
-#if 0
-    float* xout_ov = (float*)malloc(sizeof(float) * d);
-    matmul_ov(xout_ov, x, w, n, d);
-
-    for (i = 0; i < d; i++) {
-        if (abs(xout[i] - xout_ov[i]) > 0.001) {
-            printf("Mismatch at %d: %f, %f\n", i, xout[i], xout_ov[i]);
-            break;
-        }
-    }
-    free(xout_ov);
-#endif
 }
 
+bool compare_float(float* a, float* b, int count) {
+    for (int i = 0; i < count; i++) {
+        if (abs(a[i] - b[i]) > 0.0001) {
+            printf("\nMismatch at %d: %f, %f\n", i, a[i], b[i]);
+            return false;
+        }
+    }
+    return true;
+}
 
 float* forward(Transformer* transformer, int token, int pos) {
     // a few convenience variables
     Config* p = &transformer->config;
     TransformerWeights* w = &transformer->weights;
     RunState* s = &transformer->state;
+    OvModels* m = &transformer->ov_models;
     float *x = s->x;
     int dim = p->dim;
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
@@ -308,6 +304,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         s->v = s->value_cache + loff + pos * kv_dim;
 
         // qkv matmuls for this position
+        // 768 * 768 * 3 * 12 = 21,233,664      
         matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
         matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
         matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
@@ -370,6 +367,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         }
 
         // final matmul to get the output of the attention
+        // 589,824 * 12 = 7,077,888
         matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
 
         // residual connection back into x
@@ -382,6 +380,7 @@ float* forward(Transformer* transformer, int token, int pos) {
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
+        // 768 * 2048 * 2 * 12 = 37,748,736
         matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
         matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
 
@@ -396,6 +395,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         }
 
         // final matmul to get the output of the ffn
+        // 1,572,864 * 12 = 18,874,368
         matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
 
         // residual connection
@@ -408,7 +408,22 @@ float* forward(Transformer* transformer, int token, int pos) {
     rmsnorm(x, x, w->rms_final_weight, dim);
 
     // classifier into logits
-    matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
+    // 24,576,000
+    // TODO: avoid these memcpys
+    ov::Tensor input_tensor = m->to_logits_req.get_input_tensor();
+    std::memcpy(input_tensor.data(), x, sizeof(float) * p->dim);
+    m->to_logits_req.infer();
+    const ov::Tensor output_tensor = m->to_logits_req.get_output_tensor();
+    std::memcpy(s->logits, output_tensor.data(), sizeof(float) * p->vocab_size);
+
+#if 0
+    // Calc reference output and compare
+    float* ref_out = (float*)malloc(sizeof(float) * p->vocab_size);
+    matmul(ref_out, x, w->wcls, p->dim, p->vocab_size);
+    compare_float(s->logits, ref_out, p->vocab_size);
+    free(ref_out);
+#endif
+
     return s->logits;
 }
 
