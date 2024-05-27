@@ -74,6 +74,10 @@ typedef struct {
 } RunState;
 
 typedef struct {
+    std::shared_ptr<ov::Model> qkv_model;
+    ov::CompiledModel qkv_compiled_model;
+    ov::InferRequest qkv_infer_req;
+
     std::shared_ptr<ov::Model> to_logits_model;
     ov::CompiledModel to_logits_compiled_model;
     ov::InferRequest to_logits_req;
@@ -178,21 +182,60 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
 }
 
 void build_openvino_models(Transformer *t) {
+
+//void matmul(float* xout, float* x, float* w, int n, int d)
+// W (d,n) @ x (n,) -> xout (d,)
+
     std::cout << ov::get_openvino_version() << std::endl;
     std::cout << "Device info: " << std::endl;
     std::cout << core.get_versions("CPU") << std::endl;
 
-    // Classifier into logits
-    auto paramNode = std::make_shared<ov::opset13::Parameter>(ov::element::Type_t::f32, ov::Shape({(long unsigned int)t->config.dim}));
+    Config* p = &t->config;
+    TransformerWeights* w = &t->weights;
+    OvModels* models = &t->ov_models;
+    size_t dim = p->dim;
+    size_t kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
 
-    auto weightsShape = ov::Shape{(long unsigned int)t->config.vocab_size, (long unsigned int)t->config.dim};
+    // QKV
+    auto x_input = std::make_shared<ov::opset13::Parameter>(ov::element::Type_t::f32, ov::Shape({dim}));
+    auto q_weights_input = std::make_shared<ov::opset13::Parameter>(ov::element::Type_t::f32, ov::Shape({dim, dim}));
+    auto k_weights_input = std::make_shared<ov::opset13::Parameter>(ov::element::Type_t::f32, ov::Shape({kv_dim, dim}));
+    auto v_weights_input = std::make_shared<ov::opset13::Parameter>(ov::element::Type_t::f32, ov::Shape({kv_dim, dim}));
+
+/*
+    auto q_weights_shape = ov::Shape{dim, dim};
+    auto k_weights_shape = ov::Shape{kv_dim, dim};
+    auto v_weights_shape = ov::Shape{kv_dim, dim};
+
+    auto q_weights = std::make_shared<ov::opset13::Constant>(ov::element::Type_t::f32, q_weights_shape, w->wq);
+    auto k_weights = std::make_shared<ov::opset13::Constant>(ov::element::Type_t::f32, k_weights_shape, w->wk);
+    auto v_weights = std::make_shared<ov::opset13::Constant>(ov::element::Type_t::f32, v_weights_shape, w->wv);
+*/
+    auto q_matmul = std::make_shared<ov::opset13::MatMul>(x_input->output(0), q_weights_input->output(0), false, true);
+    auto k_matmul = std::make_shared<ov::opset13::MatMul>(x_input->output(0), k_weights_input->output(0), false, true);
+    auto v_matmul = std::make_shared<ov::opset13::MatMul>(x_input->output(0), v_weights_input->output(0), false, true);
+
+    auto q_result = std::make_shared<ov::opset13::Result>(q_matmul->output(0));
+    auto k_result = std::make_shared<ov::opset13::Result>(k_matmul->output(0));
+    auto v_result = std::make_shared<ov::opset13::Result>(v_matmul->output(0));
+
+    models->qkv_model = std::make_shared<ov::Model>(ov::ResultVector{q_result, k_result, v_result}, 
+                                                    ov::ParameterVector{x_input, q_weights_input, k_weights_input, v_weights_input},
+                                                    "qkvMatMul");
+    models->qkv_compiled_model = core.compile_model(models->qkv_model, "CPU");
+    models->qkv_infer_req = models->qkv_compiled_model.create_infer_request();
+
+    // Classifier into logits
+    auto paramNode = std::make_shared<ov::opset13::Parameter>(ov::element::Type_t::f32, ov::Shape({(size_t)p->dim}));
+
+    auto weightsShape = ov::Shape{(size_t)t->config.vocab_size, (size_t)t->config.dim};
     auto weightsConstNode = std::make_shared<ov::opset13::Constant>(ov::element::Type_t::f32, weightsShape, t->weights.wcls);
 
     auto matMul = std::make_shared<ov::opset13::MatMul>(paramNode->output(0), weightsConstNode->output(0), false, true);
     auto result = std::make_shared<ov::opset13::Result>(matMul->output(0));
-    t->ov_models.to_logits_model = std::make_shared<ov::Model>(result, ov::ParameterVector{paramNode}, "matmul");
-    t->ov_models.to_logits_compiled_model = core.compile_model(t->ov_models.to_logits_model, "CPU");
-    t->ov_models.to_logits_req = t->ov_models.to_logits_compiled_model.create_infer_request();
+    models->to_logits_model = std::make_shared<ov::Model>(result, ov::ParameterVector{paramNode}, "matmul");
+    models->to_logits_compiled_model = core.compile_model(models->to_logits_model, "CPU");
+    models->to_logits_req = models->to_logits_compiled_model.create_infer_request();
 }
 
 void build_transformer(Transformer *t, char* checkpoint_path) {
@@ -304,10 +347,44 @@ float* forward(Transformer* transformer, int token, int pos) {
         s->v = s->value_cache + loff + pos * kv_dim;
 
         // qkv matmuls for this position
-        // 768 * 768 * 3 * 12 = 21,233,664      
+        // 768 * 768 * 3 * 12 = 21,233,664
+#if 0
         matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
         matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
         matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+#else
+//void matmul(float* xout, float* x, float* w, int n, int d)
+// W (d,n) @ x (n,) -> xout (d,)
+
+        // TODO: avoid these memcpys
+        ov::Tensor input_tensor = m->qkv_infer_req.get_input_tensor(0);
+        ov::Tensor q_weights_tensor = m->qkv_infer_req.get_input_tensor(1);
+        ov::Tensor k_weights_tensor = m->qkv_infer_req.get_input_tensor(2);
+        ov::Tensor v_weights_tensor = m->qkv_infer_req.get_input_tensor(3);
+        std::memcpy(input_tensor.data(), s->xb, sizeof(float) * dim);
+        std::memcpy(q_weights_tensor.data(), w->wq + l*dim*dim, sizeof(float) * dim * dim);
+        std::memcpy(k_weights_tensor.data(), w->wk + l*dim*kv_dim, sizeof(float) * kv_dim * dim);
+        std::memcpy(v_weights_tensor.data(), w->wv + l*dim*kv_dim, sizeof(float) * kv_dim * dim);
+        m->qkv_infer_req.infer();
+        
+        const ov::Tensor q_output_tensor = m->qkv_infer_req.get_output_tensor(0);
+        const ov::Tensor k_output_tensor = m->qkv_infer_req.get_output_tensor(1);
+        const ov::Tensor v_output_tensor = m->qkv_infer_req.get_output_tensor(2);
+        std::memcpy(s->q, q_output_tensor.data(), sizeof(float) * dim);
+        std::memcpy(s->k, k_output_tensor.data(), sizeof(float) * kv_dim);
+        std::memcpy(s->v, v_output_tensor.data(), sizeof(float) * kv_dim);
+
+#if 0
+        float q[dim], k[kv_dim], v[kv_dim];
+        matmul(q, s->xb, w->wq + l*dim*dim, dim, dim);
+        matmul(k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
+        matmul(v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
+
+        compare_float(q, s->q, dim);
+        compare_float(k, s->k, kv_dim);
+        compare_float(v, s->v, kv_dim);
+#endif
+#endif
 
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
         for (int i = 0; i < dim; i+=2) {
