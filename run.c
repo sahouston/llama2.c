@@ -177,6 +177,27 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     memory_map_weights(weights, config, weights_ptr, shared_weights);
 }
 
+ov::Output<ov::Node> rmsnorm(const ov::Output<ov::Node>& input, const float* gamma) {
+    auto input_shape = input.get_shape();
+    size_t num_elements = ov::shape_size(input_shape);
+
+    // Compute RMS
+    auto squared = std::make_shared<ov::opset13::Multiply>(input, input);
+    int32_t axes = 0;
+    auto axes_node = std::make_shared<ov::opset13::Constant>(ov::element::i32, ov::Shape{1}, &axes);
+    auto mean_squared = std::make_shared<ov::opset13::ReduceMean>(squared->output(0), axes_node);
+    auto rms = std::make_shared<ov::opset13::Sqrt>(mean_squared);
+
+    // Normalize Input
+    auto normalized = std::make_shared<ov::opset13::Divide>(input, rms);
+
+    // Create gamma
+    auto gamma_node = std::make_shared<ov::opset13::Constant>(ov::element::f32, input_shape, gamma);
+    std::shared_ptr<ov::Node> output = std::make_shared<ov::opset13::Multiply>(normalized, gamma_node);
+
+    return output;
+}
+
 void build_openvino_models(Transformer *t) {
 
 //void matmul(float* xout, float* x, float* w, int n, int d)
@@ -190,6 +211,7 @@ void build_openvino_models(Transformer *t) {
     TransformerWeights* w = &t->weights;
     OvModels* models = &t->ov_models;
     size_t dim = p->dim;
+    size_t hidden_dim =  p->hidden_dim;
     size_t kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
     size_t vocab_size = t->config.vocab_size;
 
@@ -236,13 +258,38 @@ void build_openvino_models(Transformer *t) {
         auto o_add = std::make_shared<ov::opset13::Add>(o_input_x->output(0), o_matmul->output(0));
         auto o_output_x = std::make_shared<ov::opset13::Result>(o_add->output(0));
 
-/*
-        auto o_rms_ffn_weights = std::make_shared<ov::opset13::Constant>(ov::element::Type_t::f32,
-                                                                         ov::Shape{dim},
-                                                                         w->rms_ffn_weight + l*dim);
-        auto o_rmsnorm = std::make_shared<ov::op::internal::RMS>(o_add->output(0), o_rms_ffn_weights->output(0), 1e-5f);
-*/
-        auto o_model = std::make_shared<ov::Model>(ov::ResultVector{o_output_x, o_output_xb},
+        auto o_rms_norm = rmsnorm(o_add->output(0), w->rms_ffn_weight + l*dim);
+        auto o_output_rms_norm = std::make_shared<ov::opset13::Result>(o_rms_norm);
+
+
+        //
+        // Feed Forward Network
+        ///
+        auto ffn_weights_1 = std::make_shared<ov::opset13::Constant>(ov::element::Type_t::f32, 
+                                                                     ov::Shape{hidden_dim, dim},
+                                                                     w->w1 + l*dim*hidden_dim);
+        auto ffn_matmul_1 = std::make_shared<ov::opset13::MatMul>(o_rms_norm, ffn_weights_1, false, true);
+
+        auto ffn_weights_3 = std::make_shared<ov::opset13::Constant>(ov::element::Type_t::f32, 
+                                                                     ov::Shape{hidden_dim, dim},
+                                                                     w->w3 + l*dim*hidden_dim);
+        auto ffn_matmul_3 = std::make_shared<ov::opset13::MatMul>(o_rms_norm, ffn_weights_3, false, true);
+
+        // SwiGLU non-linearity
+        auto ffn_swish = std::make_shared<ov::opset13::Swish>(ffn_matmul_1->output(0));
+        auto ffn_swiglu = std::make_shared<ov::opset13::Multiply>(ffn_swish->output(0), ffn_matmul_3->output(0));
+        
+        // Final matmul to get the output of the ffn
+        auto ffn_weights_2 = std::make_shared<ov::opset13::Constant>(ov::element::Type_t::f32, 
+                                                                     ov::Shape{dim, hidden_dim},
+                                                                     w->w2 + l*dim*hidden_dim);
+        auto ffn_matmul_2 = std::make_shared<ov::opset13::MatMul>(ffn_swiglu->output(0), ffn_weights_2, false, true);
+
+        // Residual connection back into x
+        auto ffn_add = std::make_shared<ov::opset13::Add>(o_add->output(0), ffn_matmul_2->output(0));
+        auto ffn_output_x = std::make_shared<ov::opset13::Result>(ffn_add->output(0));
+
+        auto o_model = std::make_shared<ov::Model>(ov::ResultVector{o_output_x, o_output_xb, o_output_rms_norm, ffn_output_x},
                                                    ov::ParameterVector{o_input_x, o_input_xb});
         auto o_compiled_model = core.compile_model(o_model, "CPU");
         models->o_infer_req.push_back(o_compiled_model.create_infer_request());
@@ -466,41 +513,10 @@ float* forward(Transformer* transformer, int token, int pos) {
         for (int i = 0; i < dim; i++) {
             x[i] += s->xb2[i];
         }
-#else
-
-#ifdef VERIFY
-        float x_exp[dim], xb2_exp[dim];
-        memcpy(x_exp, x, sizeof(float) * dim);
-#endif
-
-        // TODO: avoid memcpy by applying attention (done above) directly to input_tensor
-        // instead of xb
-        ov::Tensor input_x = m->o_infer_req[l].get_input_tensor(0);
-        ov::Tensor input_xb = m->o_infer_req[l].get_input_tensor(1);
-        std::memcpy(input_x.data(), s->x, sizeof(float) * dim);
-        std::memcpy(input_xb.data(), s->xb, sizeof(float) * dim);
-        m->o_infer_req[l].infer();
-
-        const ov::Tensor o_output_x = m->o_infer_req[l].get_output_tensor(0);
-        const ov::Tensor o_output_xb2 = m->o_infer_req[l].get_output_tensor(1);
-        std::memcpy(x, o_output_x.data(), sizeof(float) * dim);
-        std::memcpy(s->xb2, o_output_xb2.data(), sizeof(float) * dim);
-
-#ifdef VERIFY
-        matmul(xb2_exp, s->xb, w->wo + l*dim*dim, dim, dim);
-        for (int i = 0; i < dim; i++) {
-            x_exp[i] += xb2_exp[i];
-        }
-
-        compare_float(x, x_exp, dim);
-#endif
-#endif        
-
-
 
         // ffn rmsnorm
         rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
-
+    
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
         // 768 * 2048 * 2 * 12 = 37,748,736
@@ -525,6 +541,29 @@ float* forward(Transformer* transformer, int token, int pos) {
         for (int i = 0; i < dim; i++) {
             x[i] += s->xb[i];
         }
+#else
+
+        // TODO: avoid memcpy by applying attention (done above) directly to input_tensor
+        // instead of xb
+        ov::Tensor input_x = m->o_infer_req[l].get_input_tensor(0);
+        ov::Tensor input_xb = m->o_infer_req[l].get_input_tensor(1);
+        std::memcpy(input_x.data(), s->x, sizeof(float) * dim);
+        std::memcpy(input_xb.data(), s->xb, sizeof(float) * dim);
+
+        m->o_infer_req[l].infer();
+
+        const ov::Tensor o_output_x = m->o_infer_req[l].get_output_tensor(0);
+        const ov::Tensor o_output_xb2 = m->o_infer_req[l].get_output_tensor(1);
+        const ov::Tensor o_output_rms_norm = m->o_infer_req[l].get_output_tensor(2);
+        const ov::Tensor ffn_output_x = m->o_infer_req[l].get_output_tensor(3);
+
+        std::memcpy(x, o_output_x.data(), sizeof(float) * dim);
+        std::memcpy(s->xb2, o_output_xb2.data(), sizeof(float) * dim);
+        //std::memcpy(s->xb, o_output_rms_norm.data(), sizeof(float) * dim);
+        std::memcpy(x, ffn_output_x.data(), sizeof(float) * dim);
+
+#endif        
+
     }
 
     // final rmsnorm
