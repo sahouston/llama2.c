@@ -75,6 +75,7 @@ typedef struct {
 
 typedef struct {
     std::vector<ov::InferRequest> qkv_infer_req; // Infer req per layer
+    std::vector<ov::InferRequest> o_infer_req; // Infer req per layer
     ov::InferRequest to_logits_req;
 } OvModels;
 
@@ -192,10 +193,12 @@ void build_openvino_models(Transformer *t) {
     size_t kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
     size_t vocab_size = t->config.vocab_size;
 
-    // QKV
-    auto x_input = std::make_shared<ov::opset13::Parameter>(ov::element::Type_t::f32, ov::Shape({dim}));
-
     for (int l = 0; l < p->n_layers; l++) {
+        //
+        // QKV
+        //
+        auto input_xb = std::make_shared<ov::opset13::Parameter>(ov::element::Type_t::f32, ov::Shape({dim}));
+
         auto q_weights = std::make_shared<ov::opset13::Constant>(ov::element::Type_t::f32, 
                                                                  ov::Shape{dim, dim},
                                                                  w->wq + l*dim*dim);
@@ -206,18 +209,43 @@ void build_openvino_models(Transformer *t) {
                                                                  ov::Shape{kv_dim, dim},
                                                                  w->wv + l*dim*kv_dim);
 
-        auto q_matmul = std::make_shared<ov::opset13::MatMul>(x_input->output(0), q_weights->output(0), false, true);
-        auto k_matmul = std::make_shared<ov::opset13::MatMul>(x_input->output(0), k_weights->output(0), false, true);
-        auto v_matmul = std::make_shared<ov::opset13::MatMul>(x_input->output(0), v_weights->output(0), false, true);
+        auto q_matmul = std::make_shared<ov::opset13::MatMul>(input_xb->output(0), q_weights->output(0), false, true);
+        auto k_matmul = std::make_shared<ov::opset13::MatMul>(input_xb->output(0), k_weights->output(0), false, true);
+        auto v_matmul = std::make_shared<ov::opset13::MatMul>(input_xb->output(0), v_weights->output(0), false, true);
 
         auto q_result = std::make_shared<ov::opset13::Result>(q_matmul->output(0));
         auto k_result = std::make_shared<ov::opset13::Result>(k_matmul->output(0));
         auto v_result = std::make_shared<ov::opset13::Result>(v_matmul->output(0));
 
         auto qkv_model = std::make_shared<ov::Model>(ov::ResultVector{q_result, k_result, v_result}, 
-                                                     ov::ParameterVector{x_input});
+                                                     ov::ParameterVector{input_xb});
         auto qkv_compiled_model = core.compile_model(qkv_model, "CPU");
         models->qkv_infer_req.push_back(qkv_compiled_model.create_infer_request());
+
+        //
+        // Attention output
+        //
+        auto o_input_x = std::make_shared<ov::opset13::Parameter>(ov::element::Type_t::f32, ov::Shape({dim}));
+        auto o_input_xb = std::make_shared<ov::opset13::Parameter>(ov::element::Type_t::f32, ov::Shape({dim}));
+        auto o_weights = std::make_shared<ov::opset13::Constant>(ov::element::Type_t::f32, 
+                                                                 ov::Shape{dim, dim},
+                                                                 w->wo + l*dim*dim);
+
+        auto o_matmul = std::make_shared<ov::opset13::MatMul>(o_input_xb->output(0), o_weights->output(0), false, true);
+        auto o_output_xb = std::make_shared<ov::opset13::Result>(o_matmul->output(0));
+        auto o_add = std::make_shared<ov::opset13::Add>(o_input_x->output(0), o_matmul->output(0));
+        auto o_output_x = std::make_shared<ov::opset13::Result>(o_add->output(0));
+
+/*
+        auto o_rms_ffn_weights = std::make_shared<ov::opset13::Constant>(ov::element::Type_t::f32,
+                                                                         ov::Shape{dim},
+                                                                         w->rms_ffn_weight + l*dim);
+        auto o_rmsnorm = std::make_shared<ov::op::internal::RMS>(o_add->output(0), o_rms_ffn_weights->output(0), 1e-5f);
+*/
+        auto o_model = std::make_shared<ov::Model>(ov::ResultVector{o_output_x, o_output_xb},
+                                                   ov::ParameterVector{o_input_x, o_input_xb});
+        auto o_compiled_model = core.compile_model(o_model, "CPU");
+        models->o_infer_req.push_back(o_compiled_model.create_infer_request());
     }
 
     // Classifier into logits
@@ -348,9 +376,6 @@ float* forward(Transformer* transformer, int token, int pos) {
         matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
         matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
 #else
-//void matmul(float* xout, float* x, float* w, int n, int d)
-// W (d,n) @ x (n,) -> xout (d,)
-
         ov::Tensor input_tensor = m->qkv_infer_req[l].get_input_tensor(0);
         std::memcpy(input_tensor.data(), s->xb, sizeof(float) * dim);
         m->qkv_infer_req[l].infer();
@@ -434,12 +459,44 @@ float* forward(Transformer* transformer, int token, int pos) {
 
         // final matmul to get the output of the attention
         // 589,824 * 12 = 7,077,888
+#if 0        
         matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
 
         // residual connection back into x
         for (int i = 0; i < dim; i++) {
             x[i] += s->xb2[i];
         }
+#else
+
+#ifdef VERIFY
+        float x_exp[dim], xb2_exp[dim];
+        memcpy(x_exp, x, sizeof(float) * dim);
+#endif
+
+        // TODO: avoid memcpy by applying attention (done above) directly to input_tensor
+        // instead of xb
+        ov::Tensor input_x = m->o_infer_req[l].get_input_tensor(0);
+        ov::Tensor input_xb = m->o_infer_req[l].get_input_tensor(1);
+        std::memcpy(input_x.data(), s->x, sizeof(float) * dim);
+        std::memcpy(input_xb.data(), s->xb, sizeof(float) * dim);
+        m->o_infer_req[l].infer();
+
+        const ov::Tensor o_output_x = m->o_infer_req[l].get_output_tensor(0);
+        const ov::Tensor o_output_xb2 = m->o_infer_req[l].get_output_tensor(1);
+        std::memcpy(x, o_output_x.data(), sizeof(float) * dim);
+        std::memcpy(s->xb2, o_output_xb2.data(), sizeof(float) * dim);
+
+#ifdef VERIFY
+        matmul(xb2_exp, s->xb, w->wo + l*dim*dim, dim, dim);
+        for (int i = 0; i < dim; i++) {
+            x_exp[i] += xb2_exp[i];
+        }
+
+        compare_float(x, x_exp, dim);
+#endif
+#endif        
+
+
 
         // ffn rmsnorm
         rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
