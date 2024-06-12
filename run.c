@@ -186,14 +186,14 @@ ov::Output<ov::Node> rmsnorm(const ov::Output<ov::Node>& input, const float* gam
     int32_t axes = 0;
     auto axes_node = std::make_shared<ov::opset13::Constant>(ov::element::i32, ov::Shape{1}, &axes);
     auto mean_squared = std::make_shared<ov::opset13::ReduceMean>(squared->output(0), axes_node);
-    auto rms = std::make_shared<ov::opset13::Sqrt>(mean_squared);
+    auto rms = std::make_shared<ov::opset13::Sqrt>(mean_squared->output(0));
 
     // Normalize Input
-    auto normalized = std::make_shared<ov::opset13::Divide>(input, rms);
+    auto normalized = std::make_shared<ov::opset13::Divide>(input, rms->output(0));
 
     // Create gamma
     auto gamma_node = std::make_shared<ov::opset13::Constant>(ov::element::f32, input_shape, gamma);
-    std::shared_ptr<ov::Node> output = std::make_shared<ov::opset13::Multiply>(normalized, gamma_node);
+    std::shared_ptr<ov::Node> output = std::make_shared<ov::opset13::Multiply>(normalized->output(0), gamma_node);
 
     return output;
 }
@@ -254,12 +254,9 @@ void build_openvino_models(Transformer *t) {
                                                                  w->wo + l*dim*dim);
 
         auto o_matmul = std::make_shared<ov::opset13::MatMul>(o_input_xb->output(0), o_weights->output(0), false, true);
-        auto o_output_xb = std::make_shared<ov::opset13::Result>(o_matmul->output(0));
         auto o_add = std::make_shared<ov::opset13::Add>(o_input_x->output(0), o_matmul->output(0));
-        auto o_output_x = std::make_shared<ov::opset13::Result>(o_add->output(0));
 
         auto o_rms_norm = rmsnorm(o_add->output(0), w->rms_ffn_weight + l*dim);
-        auto o_output_rms_norm = std::make_shared<ov::opset13::Result>(o_rms_norm);
 
 
         //
@@ -268,12 +265,12 @@ void build_openvino_models(Transformer *t) {
         auto ffn_weights_1 = std::make_shared<ov::opset13::Constant>(ov::element::Type_t::f32, 
                                                                      ov::Shape{hidden_dim, dim},
                                                                      w->w1 + l*dim*hidden_dim);
-        auto ffn_matmul_1 = std::make_shared<ov::opset13::MatMul>(o_rms_norm, ffn_weights_1, false, true);
+        auto ffn_matmul_1 = std::make_shared<ov::opset13::MatMul>(o_rms_norm, ffn_weights_1->output(0), false, true);
 
         auto ffn_weights_3 = std::make_shared<ov::opset13::Constant>(ov::element::Type_t::f32, 
                                                                      ov::Shape{hidden_dim, dim},
                                                                      w->w3 + l*dim*hidden_dim);
-        auto ffn_matmul_3 = std::make_shared<ov::opset13::MatMul>(o_rms_norm, ffn_weights_3, false, true);
+        auto ffn_matmul_3 = std::make_shared<ov::opset13::MatMul>(o_rms_norm, ffn_weights_3->output(0), false, true);
 
         // SwiGLU non-linearity
         auto ffn_swish = std::make_shared<ov::opset13::Swish>(ffn_matmul_1->output(0));
@@ -283,13 +280,13 @@ void build_openvino_models(Transformer *t) {
         auto ffn_weights_2 = std::make_shared<ov::opset13::Constant>(ov::element::Type_t::f32, 
                                                                      ov::Shape{dim, hidden_dim},
                                                                      w->w2 + l*dim*hidden_dim);
-        auto ffn_matmul_2 = std::make_shared<ov::opset13::MatMul>(ffn_swiglu->output(0), ffn_weights_2, false, true);
+        auto ffn_matmul_2 = std::make_shared<ov::opset13::MatMul>(ffn_swiglu->output(0), ffn_weights_2->output(0), false, true);
 
         // Residual connection back into x
         auto ffn_add = std::make_shared<ov::opset13::Add>(o_add->output(0), ffn_matmul_2->output(0));
         auto ffn_output_x = std::make_shared<ov::opset13::Result>(ffn_add->output(0));
 
-        auto o_model = std::make_shared<ov::Model>(ov::ResultVector{o_output_x, o_output_xb, o_output_rms_norm, ffn_output_x},
+        auto o_model = std::make_shared<ov::Model>(ffn_output_x,
                                                    ov::ParameterVector{o_input_x, o_input_xb});
         auto o_compiled_model = core.compile_model(o_model, "CPU");
         models->o_infer_req.push_back(o_compiled_model.create_infer_request());
@@ -434,17 +431,6 @@ float* forward(Transformer* transformer, int token, int pos) {
         std::memcpy(s->q, q_output_tensor.data(), sizeof(float) * dim);
         std::memcpy(s->k, k_output_tensor.data(), sizeof(float) * kv_dim);
         std::memcpy(s->v, v_output_tensor.data(), sizeof(float) * kv_dim);
-
-#if 0
-        float q[dim], k[kv_dim], v[kv_dim];
-        matmul(q, s->xb, w->wq + l*dim*dim, dim, dim);
-        matmul(k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
-        matmul(v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
-
-        compare_float(q, s->q, dim);
-        compare_float(k, s->k, kv_dim);
-        compare_float(v, s->v, kv_dim);
-#endif
 #endif
 
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
@@ -552,16 +538,8 @@ float* forward(Transformer* transformer, int token, int pos) {
 
         m->o_infer_req[l].infer();
 
-        const ov::Tensor o_output_x = m->o_infer_req[l].get_output_tensor(0);
-        const ov::Tensor o_output_xb2 = m->o_infer_req[l].get_output_tensor(1);
-        const ov::Tensor o_output_rms_norm = m->o_infer_req[l].get_output_tensor(2);
-        const ov::Tensor ffn_output_x = m->o_infer_req[l].get_output_tensor(3);
-
-        std::memcpy(x, o_output_x.data(), sizeof(float) * dim);
-        std::memcpy(s->xb2, o_output_xb2.data(), sizeof(float) * dim);
-        //std::memcpy(s->xb, o_output_rms_norm.data(), sizeof(float) * dim);
+        const ov::Tensor ffn_output_x = m->o_infer_req[l].get_output_tensor(0);
         std::memcpy(x, ffn_output_x.data(), sizeof(float) * dim);
-
 #endif        
 
     }
