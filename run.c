@@ -300,15 +300,20 @@ void build_openvino_models(Transformer *t) {
         models->o_infer_req.push_back(o_compiled_model.create_infer_request());
     }
 
+    // final rmsnorm
+    auto m3_input_x = std::make_shared<ov::opset13::Parameter>(ov::element::Type_t::f32, ov::Shape({dim}));
+
+    auto m3_rms_norm = rmsnorm(m3_input_x->output(0), w->rms_final_weight);
+
     // Classifier into logits
-    auto paramNode = std::make_shared<ov::opset13::Parameter>(ov::element::Type_t::f32, ov::Shape({dim}));
     auto weightsConstNode = std::make_shared<ov::opset13::Constant>(ov::element::Type_t::f32, 
                                                                     ov::Shape({vocab_size, dim}), 
                                                                     t->weights.wcls);
 
-    auto matMul = std::make_shared<ov::opset13::MatMul>(paramNode->output(0), weightsConstNode->output(0), false, true);
+    // TODO: why do we not need m3_rms_norm->output(0) here?
+    auto matMul = std::make_shared<ov::opset13::MatMul>(m3_rms_norm, weightsConstNode->output(0), false, true);
     auto result = std::make_shared<ov::opset13::Result>(matMul->output(0));
-    auto to_logits_model = std::make_shared<ov::Model>(result, ov::ParameterVector{paramNode}, "matmul");
+    auto to_logits_model = std::make_shared<ov::Model>(result, ov::ParameterVector{m3_input_x}, "matmul");
     auto to_logits_compiled_model = core.compile_model(to_logits_model, "CPU");
     models->to_logits_req = to_logits_compiled_model.create_infer_request();
 }
@@ -399,8 +404,7 @@ float* forward(Transformer* transformer, int token, int pos) {
     TransformerWeights* w = &transformer->weights;
     RunState* s = &transformer->state;
     OvModels* m = &transformer->ov_models;
-    float *x = s->x;
-    int dim = p->dim;
+    size_t dim = p->dim;
     int kv_dim = (p->dim * p->n_kv_heads) / p->n_heads;
     int kv_mul = p->n_heads / p->n_kv_heads; // integer multiplier of the kv sharing in multiquery
     int hidden_dim =  p->hidden_dim;
@@ -408,7 +412,9 @@ float* forward(Transformer* transformer, int token, int pos) {
 
     // copy the token embedding into x
     float* content_row = w->token_embedding_table + token * dim;
-    memcpy(x, content_row, dim*sizeof(*x));
+    
+    ov::Tensor x_tensor(ov::element::Type_t::f32, ov::Shape({dim}));
+    std::memcpy(x_tensor.data(), content_row, sizeof(float) * dim);
 
     // forward all the layers
     for(unsigned long long l = 0; l < p->n_layers; l++) {
@@ -428,8 +434,7 @@ float* forward(Transformer* transformer, int token, int pos) {
         matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
         matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
 #else
-        ov::Tensor input_x = m->qkv_infer_req[l].get_input_tensor(0);
-        std::memcpy(input_x.data(), x, sizeof(float) * dim);
+        m->qkv_infer_req[l].set_input_tensor(0, x_tensor);
         m->qkv_infer_req[l].infer();
 
         // TODO: avoid these memcpys        
@@ -537,40 +542,24 @@ float* forward(Transformer* transformer, int token, int pos) {
         }
 #else
 
-        // TODO: avoid memcpy by applying attention (done above) directly to input_tensor
-        // instead of xb
-        ov::Tensor input_x2 = m->o_infer_req[l].get_input_tensor(0);
+        m->o_infer_req[l].set_input_tensor(0, x_tensor);
         ov::Tensor input_xb = m->o_infer_req[l].get_input_tensor(1);
-        std::memcpy(input_x2.data(), s->x, sizeof(float) * dim);
         std::memcpy(input_xb.data(), s->xb, sizeof(float) * dim);
 
         m->o_infer_req[l].infer();
 
         const ov::Tensor ffn_output_x = m->o_infer_req[l].get_output_tensor(0);
-        std::memcpy(x, ffn_output_x.data(), sizeof(float) * dim);
+        std::memcpy(x_tensor.data(), ffn_output_x.data(), sizeof(float) * dim);
 #endif        
 
     }
 
-    // final rmsnorm
-    rmsnorm(x, x, w->rms_final_weight, dim);
-
     // classifier into logits
     // 24,576,000
-    // TODO: avoid these memcpys
-    ov::Tensor input_tensor = m->to_logits_req.get_input_tensor();
-    std::memcpy(input_tensor.data(), x, sizeof(float) * p->dim);
+    m->to_logits_req.set_input_tensor(0, x_tensor);
     m->to_logits_req.infer();
     const ov::Tensor output_tensor = m->to_logits_req.get_output_tensor();
     std::memcpy(s->logits, output_tensor.data(), sizeof(float) * p->vocab_size);
-
-#if 0
-    // Calc reference output and compare
-    float* ref_out = (float*)malloc(sizeof(float) * p->vocab_size);
-    matmul(ref_out, x, w->wcls, p->dim, p->vocab_size);
-    compare_float(s->logits, ref_out, p->vocab_size);
-    free(ref_out);
-#endif
 
     return s->logits;
 }
