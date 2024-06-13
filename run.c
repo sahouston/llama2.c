@@ -186,7 +186,10 @@ ov::Output<ov::Node> rmsnorm(const ov::Output<ov::Node>& input, const float* gam
     int32_t axes = 0;
     auto axes_node = std::make_shared<ov::opset13::Constant>(ov::element::i32, ov::Shape{1}, &axes);
     auto mean_squared = std::make_shared<ov::opset13::ReduceMean>(squared->output(0), axes_node);
-    auto rms = std::make_shared<ov::opset13::Sqrt>(mean_squared->output(0));
+    float eps = 1e-5f;
+    auto eps_node = std::make_shared<ov::opset13::Constant>(ov::element::f32, ov::Shape{1}, &eps);
+    auto mean_squared_plus_eps = std::make_shared<ov::opset13::Add>(mean_squared->output(0), eps_node);
+    auto rms = std::make_shared<ov::opset13::Sqrt>(mean_squared_plus_eps->output(0));
 
     // Normalize Input
     auto normalized = std::make_shared<ov::opset13::Divide>(input, rms->output(0));
@@ -216,11 +219,16 @@ void build_openvino_models(Transformer *t) {
     size_t vocab_size = t->config.vocab_size;
 
     for (int l = 0; l < p->n_layers; l++) {
+
+        //
+        // Attention RMSNorm
+        //
+        auto input_x = std::make_shared<ov::opset13::Parameter>(ov::element::Type_t::f32, ov::Shape({dim}));
+        auto att_rms_norm = rmsnorm(input_x->output(0), w->rms_att_weight + l*dim);
+
         //
         // QKV
         //
-        auto input_xb = std::make_shared<ov::opset13::Parameter>(ov::element::Type_t::f32, ov::Shape({dim}));
-
         auto q_weights = std::make_shared<ov::opset13::Constant>(ov::element::Type_t::f32, 
                                                                  ov::Shape{dim, dim},
                                                                  w->wq + l*dim*dim);
@@ -231,16 +239,16 @@ void build_openvino_models(Transformer *t) {
                                                                  ov::Shape{kv_dim, dim},
                                                                  w->wv + l*dim*kv_dim);
 
-        auto q_matmul = std::make_shared<ov::opset13::MatMul>(input_xb->output(0), q_weights->output(0), false, true);
-        auto k_matmul = std::make_shared<ov::opset13::MatMul>(input_xb->output(0), k_weights->output(0), false, true);
-        auto v_matmul = std::make_shared<ov::opset13::MatMul>(input_xb->output(0), v_weights->output(0), false, true);
+        auto q_matmul = std::make_shared<ov::opset13::MatMul>(att_rms_norm, q_weights->output(0), false, true);
+        auto k_matmul = std::make_shared<ov::opset13::MatMul>(att_rms_norm, k_weights->output(0), false, true);
+        auto v_matmul = std::make_shared<ov::opset13::MatMul>(att_rms_norm, v_weights->output(0), false, true);
 
         auto q_result = std::make_shared<ov::opset13::Result>(q_matmul->output(0));
         auto k_result = std::make_shared<ov::opset13::Result>(k_matmul->output(0));
         auto v_result = std::make_shared<ov::opset13::Result>(v_matmul->output(0));
 
         auto qkv_model = std::make_shared<ov::Model>(ov::ResultVector{q_result, k_result, v_result}, 
-                                                     ov::ParameterVector{input_xb});
+                                                     ov::ParameterVector{input_x});
         auto qkv_compiled_model = core.compile_model(qkv_model, "CPU");
         models->qkv_infer_req.push_back(qkv_compiled_model.create_infer_request());
 
@@ -405,9 +413,6 @@ float* forward(Transformer* transformer, int token, int pos) {
     // forward all the layers
     for(unsigned long long l = 0; l < p->n_layers; l++) {
 
-        // attention rmsnorm
-        rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
-
         // key and value point to the kv cache
         int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
         s->k = s->key_cache + loff + pos * kv_dim;
@@ -416,12 +421,15 @@ float* forward(Transformer* transformer, int token, int pos) {
         // qkv matmuls for this position
         // 768 * 768 * 3 * 12 = 21,233,664
 #if 0
+        // attention rmsnorm
+        rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
+
         matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
         matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
         matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
 #else
-        ov::Tensor input_tensor = m->qkv_infer_req[l].get_input_tensor(0);
-        std::memcpy(input_tensor.data(), s->xb, sizeof(float) * dim);
+        ov::Tensor input_x = m->qkv_infer_req[l].get_input_tensor(0);
+        std::memcpy(input_x.data(), x, sizeof(float) * dim);
         m->qkv_infer_req[l].infer();
 
         // TODO: avoid these memcpys        
@@ -531,9 +539,9 @@ float* forward(Transformer* transformer, int token, int pos) {
 
         // TODO: avoid memcpy by applying attention (done above) directly to input_tensor
         // instead of xb
-        ov::Tensor input_x = m->o_infer_req[l].get_input_tensor(0);
+        ov::Tensor input_x2 = m->o_infer_req[l].get_input_tensor(0);
         ov::Tensor input_xb = m->o_infer_req[l].get_input_tensor(1);
-        std::memcpy(input_x.data(), s->x, sizeof(float) * dim);
+        std::memcpy(input_x2.data(), s->x, sizeof(float) * dim);
         std::memcpy(input_xb.data(), s->xb, sizeof(float) * dim);
 
         m->o_infer_req[l].infer();
