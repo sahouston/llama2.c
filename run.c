@@ -21,6 +21,7 @@
 #endif
 
 ov::Core core;
+constexpr const char* use_device = "CPU";
 
 // ----------------------------------------------------------------------------
 // Transformer model
@@ -208,7 +209,7 @@ void build_openvino_models(Transformer *t) {
 
     std::cout << ov::get_openvino_version() << std::endl;
     std::cout << "Device info: " << std::endl;
-    std::cout << core.get_versions("CPU") << std::endl;
+    std::cout << core.get_versions(use_device) << std::endl;
 
     Config* p = &t->config;
     TransformerWeights* w = &t->weights;
@@ -249,7 +250,7 @@ void build_openvino_models(Transformer *t) {
 
         auto qkv_model = std::make_shared<ov::Model>(ov::ResultVector{q_result, k_result, v_result}, 
                                                      ov::ParameterVector{input_x});
-        auto qkv_compiled_model = core.compile_model(qkv_model, "CPU");
+        auto qkv_compiled_model = core.compile_model(qkv_model, use_device);
         models->qkv_infer_req.push_back(qkv_compiled_model.create_infer_request());
 
         //
