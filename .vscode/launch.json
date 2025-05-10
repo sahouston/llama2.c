@@ -1,0 +1,16 @@
+{
+    "configurations": [
+        {
+            "name": "(Windows) Launch",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "C:/github/sahouston/llama2.c/build/run.exe",
+            "args": [".\\stories110M.bin", "-n", "256", "-i", "one day"],
+            "stopAtEntry": true,
+            "cwd": "C:/github/sahouston/llama2.c/",
+            "environment": [],
+            "console": "internalConsole"
+        }
+    ],
+    "version": "2.0.0"
+}

@@ -1,5 +1,19 @@
 /* Inference for Llama-2 Transformer model in pure C */
 
+//   mkdir build
+//   cd build
+//
+// Release build:
+//   cmake -G "NMake Makefiles" ..
+//   cmake --build . --config Release
+//
+// Debug build:
+//   cmake -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Debug ..
+//   cmake --build . --config Debug
+//
+// Run:
+//   build\run.exe .\stories110M.bin -n 256 -i "one day"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
@@ -160,11 +174,17 @@ void read_checkpoint(char* checkpoint, Config* config, TransformerWeights* weigh
     fseek(file, 0, SEEK_END); // move file pointer to end of file
     *file_size = ftell(file); // get the file size, in bytes
     fclose(file);
-    // memory map the Transformer weights into the data pointer
-    *fd = open(checkpoint, O_RDONLY); // open in read only mode
-    if (*fd == -1) { fprintf(stderr, "open failed!\n"); exit(EXIT_FAILURE); }
-    *data = (float*)mmap(NULL, *file_size, PROT_READ, MAP_PRIVATE, *fd, 0);
-    if (*data == MAP_FAILED) { fprintf(stderr, "mmap failed!\n"); exit(EXIT_FAILURE); }
+    // allocate memory and read file content into it
+    *data = (float*)malloc(*file_size);
+    if (*data == NULL) { fprintf(stderr, "malloc failed!\n"); exit(EXIT_FAILURE); }
+    file = fopen(checkpoint, "rb");
+    if (file == NULL) { fprintf(stderr, "fopen failed!\n"); exit(EXIT_FAILURE); }
+    if (fread(*data, 1, *file_size, file) != *file_size) { 
+        fprintf(stderr, "fread failed!\n"); 
+        exit(EXIT_FAILURE); 
+    }
+    fclose(file);
+    *fd = 0;
     float* weights_ptr = *data + sizeof(Config)/sizeof(float);
     memory_map_weights(weights, config, weights_ptr, shared_weights);
 }
@@ -178,8 +198,9 @@ void build_transformer(Transformer *t, char* checkpoint_path) {
 
 void free_transformer(Transformer* t) {
     // close the memory mapping
-    if (t->data != MAP_FAILED) { munmap(t->data, t->file_size); }
-    if (t->fd != -1) { close(t->fd); }
+//    if (t->data != MAP_FAILED) { munmap(t->data, t->file_size); }
+//    if (t->fd != -1) { close(t->fd); }
+    if (t->data) free(t->data);
     // free the RunState buffers
     free_run_state(&t->state);
 }
