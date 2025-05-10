@@ -13,8 +13,10 @@ cmake_minimum_required (VERSION 3.4)
 
 project(llama2_cpp CXX)
 
+find_package(dnnl CONFIG REQUIRED)
+
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -Od")
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3")
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -g -fno-omit-frame-pointer")
 
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
@@ -28,11 +30,11 @@ if(WIN32)
     set(WIN_FLAG "/EHsc")
 endif()
 
-#set(COMPILE_FLAGS "-fsycl -Wall ${WIN_FLAG} -D_CRT_SECURE_NO_WARNINGS -DONE_API")
-set(COMPILE_FLAGS "-fsycl -Wall ${WIN_FLAG} -D_CRT_SECURE_NO_WARNINGS")
+set(COMPILE_FLAGS "-fsycl -Wall ${WIN_FLAG} -D_CRT_SECURE_NO_WARNINGS -DONE_API")
 set(LINK_FLAGS "-fsycl")
 
 add_executable(${TARGET_NAME} ${SOURCE_FILES})
 set_target_properties(${TARGET_NAME} PROPERTIES COMPILE_FLAGS "${COMPILE_FLAGS}")
 set_target_properties(${TARGET_NAME} PROPERTIES LINK_FLAGS "${LINK_FLAGS}")
+target_link_libraries(${TARGET_NAME} PRIVATE DNNL::dnnl)
 add_custom_target(cpu-gpu DEPENDS ${TARGET_NAME})

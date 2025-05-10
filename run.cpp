@@ -303,6 +303,12 @@ float* forward(Transformer* transformer, int token, int pos) {
     float* content_row = w->token_embedding_table + token * dim;
     memcpy(x, content_row, dim*sizeof(*x));
 
+    static bool once = false;
+    if (!once) {
+        std::cout << "dim: " << dim << " kv_dim: " << kv_dim << " hidden_dim: " << hidden_dim << std::endl;
+        once = true;
+    }
+
     // forward all the layers
     for(unsigned long long l = 0; l < p->n_layers; l++) {
 
@@ -873,7 +879,6 @@ void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
     int8_t user_turn = 1; // user starts
     int next;        // will store the next token in the sequence
     int token;       // stores the current token to feed into the transformer
-    int prev_token;
     int pos = 0;     // position in the sequence
     while (pos < steps) {
 
